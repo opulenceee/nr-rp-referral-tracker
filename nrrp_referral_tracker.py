@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 import asyncio
 from typing import Optional
+from discord.ext.commands import dm_only, cooldown, BucketType, CommandOnCooldown
 
 # Configuration
 import os
@@ -24,20 +25,20 @@ GUILD_ID = int(os.getenv('GUILD_ID'))
 COMMANDS_CHANNEL_ID = int(os.getenv('COMMANDS_CHANNEL_ID'))
 LEADERBOARD_CHANNEL_ID = int(os.getenv('LEADERBOARD_CHANNEL_ID'))
 
+def check_channel(ctx):
+    """Check if command is used in allowed channels"""
+    # Only validate command needs channel check now
+    return ctx.channel.id in [COMMANDS_CHANNEL_ID, LEADERBOARD_CHANNEL_ID]
+
 # Store invite cache and last leaderboard message
 invite_cache = {}
 last_leaderboard_message: Optional[discord.Message] = None
-
-def check_channel(ctx):
-    """Check if command is used in allowed channels"""
-    return ctx.channel.id in [COMMANDS_CHANNEL_ID, LEADERBOARD_CHANNEL_ID]
 
 # Database setup
 def setup_database():
     conn = sqlite3.connect('referrals.db')
     c = conn.cursor()
     
-    # Create the main referrals table with the new is_member_active column
     c.execute('''CREATE TABLE IF NOT EXISTS referrals
                  (inviter_id TEXT,
                   inviter_name TEXT,
@@ -49,51 +50,122 @@ def setup_database():
                   has_resident_role BOOLEAN DEFAULT FALSE,
                   is_member_active BOOLEAN DEFAULT TRUE)''')
     
-    # Check if is_member_active column exists, if not add it
-    c.execute("PRAGMA table_info(referrals)")
-    columns = [column[1] for column in c.fetchall()]
-    if 'is_member_active' not in columns:
-        c.execute('ALTER TABLE referrals ADD COLUMN is_member_active BOOLEAN DEFAULT TRUE')
-    
     conn.commit()
     conn.close()
 
-async def post_leaderboard():
-    """Posts or updates the leaderboard in the designated channel"""
+async def validate_referrals(guild):
+    """Validates all referrals and updates their status"""
+    print('\n[Auto-Validation] Starting validation process...')
+    
+    resident_role = discord.utils.get(guild.roles, name='resident')
+    if not resident_role:
+        print("Error: 'resident' role not found!")
+        return
+
+    conn = sqlite3.connect('referrals.db')
+    c = conn.cursor()
+    
+    # Reset all validations first
+    c.execute('UPDATE referrals SET is_validated = FALSE')
+    
+    # Get all active referrals
+    c.execute('SELECT inviter_id, invited_id FROM referrals WHERE is_member_active = TRUE')
+    referrals = c.fetchall()
+    
+    validated_count = 0
+    for inviter_id, invited_id in referrals:
+        inviter = guild.get_member(int(inviter_id))
+        invited = guild.get_member(int(invited_id))
+        
+        if (inviter and invited and 
+            resident_role in inviter.roles and 
+            resident_role in invited.roles):
+            c.execute('''UPDATE referrals 
+                        SET is_validated = TRUE 
+                        WHERE inviter_id = ? AND invited_id = ?''',
+                     (inviter_id, invited_id))
+            validated_count += 1
+    
+    conn.commit()
+    conn.close()
+    print(f'[Auto-Validation] Completed! Validated {validated_count} referrals')
+
+async def update_leaderboard():
+    """Creates and posts the leaderboard message"""
     print('\n[Leaderboard] Updating leaderboard...')
     global last_leaderboard_message
     
-    if not LEADERBOARD_CHANNEL_ID:
-        return
-        
     channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
     if not channel:
         return
-
-    # Create a mock message to get context
-    mock_message = await channel.fetch_message(channel.last_message_id) if channel.last_message_id else None
-    if not mock_message:
-        mock_message = discord.Message(state=bot._connection, channel=channel, data={
-            "id": 0,
-            "channel_id": channel.id,
-            "author": {"id": bot.user.id}
-        })
     
-    ctx = await bot.get_context(mock_message)
-    
+    # Delete previous leaderboard message if it exists
     try:
         if last_leaderboard_message:
             await last_leaderboard_message.delete()
     except discord.NotFound:
         pass
     
-    last_leaderboard_message = await show_leaderboard(ctx)
+    conn = sqlite3.connect('referrals.db')
+    c = conn.cursor()
+    
+    c.execute('''
+        SELECT 
+            inviter_id,
+            inviter_name,
+            SUM(CASE WHEN is_validated = TRUE AND is_member_active = TRUE THEN 1 ELSE 0 END) as validated_count,
+            SUM(CASE WHEN is_validated = FALSE AND is_member_active = TRUE THEN 1 ELSE 0 END) as unvalidated_count,
+            SUM(CASE WHEN is_member_active = TRUE THEN 1 ELSE 0 END) as total_count
+        FROM referrals 
+        GROUP BY inviter_id, inviter_name
+        HAVING total_count > 0
+        ORDER BY validated_count DESC, total_count DESC
+        LIMIT 10
+    ''')
+    
+    leaderboard = c.fetchall()
+    conn.close()
+    
+    embed = discord.Embed(
+        title="<:nrrp:1313023333251420210> Referral Leaderboard", 
+        color=discord.Color.red(),
+        description="📢 **Reminder:** The joinee needs to whitelist in order for your invite to be verified! **Please make sure they do so!**\n\u200b"
+    )
+    
+    if not leaderboard:
+        embed.description += "\nNo referrals tracked yet! Be the first one to invite someone! ⭐"
+        last_leaderboard_message = await channel.send(embed=embed)
+        return
+    
+    leaderboard_text = "```\nInviter              ✅ Verified   ⏳ Pending   📊 Total\n"
+    leaderboard_text += "─" * 56 + "\n"
 
-async def auto_leaderboard_loop():
-    """Background task to update leaderboard every 24 hours"""
+    guild = bot.get_guild(GUILD_ID)
+    for i, (inviter_id, inviter_name, validated, unvalidated, total) in enumerate(leaderboard, 1):
+        inviter = guild.get_member(int(inviter_id))
+        current_name = inviter.name if inviter else inviter_name or f"User {inviter_id}"
+        
+        name_field = f"{i}. {current_name[:20]}"
+        leaderboard_text += f"{name_field:<24}   {validated:^10}   {unvalidated:^10}   {total:^6}\n"
+
+    leaderboard_text += "```"
+    embed.add_field(name="\u200b", value=leaderboard_text, inline=False)
+    
+    # Add timestamp to show when the leaderboard was last updated
+    embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    last_leaderboard_message = await channel.send(embed=embed)
+    print('[Leaderboard] Updated successfully!')
+
+async def auto_update_loop():
+    """Background task to validate referrals and update leaderboard every 24 hours"""
     await bot.wait_until_ready()
     while not bot.is_closed():
-        await post_leaderboard()
+        guild = bot.get_guild(GUILD_ID)
+        if guild:
+            await validate_referrals(guild)  # Validate first
+            await asyncio.sleep(1)  # Add a small delay
+            await update_leaderboard()  # Then update the leaderboard
         await asyncio.sleep(86400)  # 24 hours
 
 @bot.event
@@ -115,8 +187,80 @@ async def on_ready():
         invite_cache[guild.id] = invites
         print(f'Cached {len(invites)} invites for guild: {guild.name}')
     
-    print('Starting auto-leaderboard task...')
-    bot.loop.create_task(auto_leaderboard_loop())
+    # Send the initial messages in the leaderboard channel
+    leaderboard_channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if leaderboard_channel:
+        try:
+            # Check if pinned info message already exists
+            pins = await leaderboard_channel.pins()
+            info_message_exists = any(
+                pin.author == bot.user and 
+                pin.embeds and 
+                pin.embeds[0].title == "<:nrrp:1313023333251420210> Referral Leaderboard"
+                for pin in pins
+            )
+            
+            if not info_message_exists:
+                # First, send and pin the info message
+                info_embed = discord.Embed(
+                    title="<:nrrp:1313023333251420210> Referral System Guide", 
+                    color=discord.Color.red(),
+                    description="Welcome to our referral system! Here's everything you need to know about inviting new members and earning rewards.\n\u200b"
+                )
+                
+                info_embed.add_field(
+                    name="🎯 Verification Requirements",
+                    value="• Invites only count after the new member completes whitelisting\n"
+                          "• Make sure your invitees complete the verification process\n"
+                          "• Tracking begins automatically when someone uses your invite\n\u200b",
+                    inline=False
+                )
+                
+                info_embed.add_field(
+                    name="💎 Current Reward Tiers",
+                    value="• **🥇 1st Place** → Custom MLO!\n"
+                        "• **🥈 2nd Place** → 2 Months of Gold Supporter.\n"
+                        "• **🥉 3rd Place** → 2 Months of Silver Supporter.\n",
+                    inline=False
+                )
+                
+                info_embed.add_field(
+                    name="📊 Tracking & Commands",
+                    value="• Use `!myreferrals` in DMs to view your invitation history\n"
+                          "• Check `!leaderboard` in DMs to see current rankings\n"
+                          "• Leaderboard below updates automatically every 24 hours\n"
+                          "• Commands have a 15-minute cooldown\n\u200b",
+                    inline=False
+                )
+                
+                info_embed.add_field(
+                    name="⚠️ Important Notes",
+                    value="• Only whitelisted members count towards rewards\n"
+                          "• If an invitee leaves, their verification is removed\n",
+                    inline=False
+                )
+                
+                info_embed.set_footer(text="📢 Remember: The joinee needs to whitelist for your invite to be verified!")
+                info_message = await leaderboard_channel.send(embed=info_embed)
+                await info_message.pin()
+                print("Pinned info message sent successfully!")
+            else:
+                print("Info message already exists in pins, skipping...")
+                
+        except discord.HTTPException as e:
+            print(f"Error with info message: {str(e)}")
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            
+        # Add a small delay before starting auto-update
+        await asyncio.sleep(1)
+        
+    else:
+        print("ERROR: Could not find leaderboard channel!")
+    
+    # Start the auto-update task for the leaderboard
+    print('Starting auto-update task...')
+    bot.loop.create_task(auto_update_loop())
     
     print('-'*50)
     print('Bot is ready and running!')
@@ -141,20 +285,17 @@ async def on_member_join(member):
     
     if has_previous_record:
         print(f'Found previous record for {member.name}, reactivating...')
-        # Reactivate their record if they were previously invited
         c.execute('''UPDATE referrals 
                      SET is_member_active = TRUE,
                          is_validated = FALSE
                      WHERE invited_id = ?''', 
                   (str(member.id),))
         
-        # Also reactivate any records where they were the inviter
         c.execute('''UPDATE referrals 
                      SET is_member_active = TRUE
                      WHERE inviter_id = ?''',
                   (str(member.id),))
     else:
-        # Process new invite only if no previous record exists
         for invite in invites_after:
             cached_invite = next((x for x in invite_cache[member.guild.id] if x.code == invite.code), None)
             if cached_invite is None or invite.uses > cached_invite.uses:
@@ -180,6 +321,12 @@ async def on_member_join(member):
     
     # Update invite cache
     invite_cache[member.guild.id] = invites_after
+    
+    # Update leaderboard immediately when someone joins
+    guild = member.guild
+    await validate_referrals(guild)  # Validate first
+    await asyncio.sleep(1)  # Add a small delay
+    await update_leaderboard()  # Then update the leaderboard
 
 @bot.event
 async def on_member_remove(member):
@@ -188,14 +335,12 @@ async def on_member_remove(member):
     conn = sqlite3.connect('referrals.db')
     c = conn.cursor()
     
-    # Mark records as inactive where the leaving member was invited
     c.execute('''UPDATE referrals 
                  SET is_validated = FALSE,
                      is_member_active = FALSE
                  WHERE invited_id = ?''', 
               (str(member.id),))
     
-    # Mark records as inactive where the leaving member was the inviter
     c.execute('''UPDATE referrals 
                  SET is_validated = FALSE,
                      is_member_active = FALSE
@@ -204,17 +349,25 @@ async def on_member_remove(member):
     
     conn.commit()
     conn.close()
+    
+    # Update leaderboard immediately when someone leaves
+    guild = member.guild
+    await validate_referrals(guild)  # Validate first
+    await asyncio.sleep(1)  # Add a small delay
+    await update_leaderboard()  # Then update the leaderboard
 
 @bot.command(name='validate')
 @commands.has_permissions(administrator=True)
 @commands.check(check_channel)
-async def validate_referrals(ctx):
+async def validate_referrals_command(ctx):
     print(f'\n[Command] Validate command used by {ctx.author.name} (ID: {ctx.author.id})')
     resident_role = discord.utils.get(ctx.guild.roles, name='resident')
     if not resident_role:
         await ctx.send("Error: 'resident' role not found!")
         return
 
+    status_message = await ctx.send("Starting validation process...")
+    
     conn = sqlite3.connect('referrals.db')
     c = conn.cursor()
     
@@ -227,7 +380,6 @@ async def validate_referrals(ctx):
     
     validated_count = 0
     invalid_count = 0
-    status_message = await ctx.send("Starting validation process...")
     
     for inviter_id, invited_id in referrals:
         inviter = ctx.guild.get_member(int(inviter_id))
@@ -278,10 +430,16 @@ async def validate_referrals(ctx):
     await status_message.delete()
     await ctx.send(embed=embed)
     
-    await post_leaderboard()
+    # Update leaderboard with confirmation
+    status_message = await ctx.send("🔄 Updating leaderboard...")
+    await asyncio.sleep(1)
+    await update_leaderboard()
+    await status_message.edit(content="✅ Validation complete and leaderboard has been updated!")
 
+# Update the myreferrals command
 @bot.command(name='myreferrals')
-@commands.check(check_channel)
+@dm_only()
+@cooldown(1, 900, BucketType.user)  # 1 use per 15 minutes (900 seconds) per user
 async def show_my_referrals(ctx):
     print(f'\n[Command] Myreferrals command used by {ctx.author.name} (ID: {ctx.author.id})')
     conn = sqlite3.connect('referrals.db')
@@ -297,15 +455,51 @@ async def show_my_referrals(ctx):
     conn.close()
     
     if not referrals:
-        await ctx.send("You haven't invited anyone yet!")
+        embed = discord.Embed(
+            title="🏆 Referral Rewards Await!",
+            color=discord.Color.gold(),
+            description="Start your journey to exclusive rewards by inviting new members to our community!"
+        )
+        
+        embed.add_field(
+            name="💎 Current Reward Tiers",
+            value="• **🥇 1st Place** → Custom MLO!\n"
+                  "• **🥈 2nd Place** → 2 Months of Gold Supporter.\n"
+                  "• **🥉 3rd Place** → 2 Months of Silver Supporter.\n",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🚀 Quick Start Guide",
+            value="1. Generate your invite link using `/invite` in the server\n"
+                  "2. Share with friends who'd enjoy our community\n"
+                  "3. Track your progress with `!myreferrals`\n"
+                  "4. Remember: Invitees must verify to count!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💫 Pro Tips",
+            value="• Verified invites are the only ones that count!\n"
+                  "• Check `!leaderboard` to see your ranking\n"
+                  "• The more active your invites, the better your rewards!",
+            inline=False
+        )
+        
+        embed.set_footer(text="🎁 Don't miss out on these exclusive rewards - start inviting today!")
+        
+        await ctx.send(embed=embed)
         return
     
     embed = discord.Embed(title="Your Referrals", 
                          color=discord.Color.red(),
                          description=f"Total referrals: {len(referrals)}")
     
+    # Get the guild object for member lookup
+    guild = bot.get_guild(GUILD_ID)
+    
     for invited_id, invite_code, joined_at, is_validated, is_member_active in referrals:
-        member = ctx.guild.get_member(int(invited_id))
+        member = guild.get_member(int(invited_id))
         member_name = member.name if member else f"User {invited_id}"
         
         if is_member_active:
@@ -321,45 +515,10 @@ async def show_my_referrals(ctx):
     
     await ctx.send(embed=embed)
 
-@bot.command(name='refreshboard')
-@commands.check(check_channel)
-async def refresh_leaderboard(ctx):
-    print(f'\n[Command] Refreshboard command used by {ctx.author.name} (ID: {ctx.author.id})')
-    
-    status_message = await ctx.send("🔄 Refreshing leaderboard and validation statuses...")
-    
-    resident_role = discord.utils.get(ctx.guild.roles, name='Resident')
-    if not resident_role:
-        await ctx.send("Error: 'Resident' role not found!")
-        return
-
-    conn = sqlite3.connect('referrals.db')
-    c = conn.cursor()
-    
-    c.execute('SELECT inviter_id, invited_id FROM referrals WHERE is_member_active = TRUE')
-    referrals = c.fetchall()
-    
-    for inviter_id, invited_id in referrals:
-        inviter = ctx.guild.get_member(int(inviter_id))
-        invited = ctx.guild.get_member(int(invited_id))
-        
-        is_valid = (inviter and invited and 
-                   resident_role in inviter.roles and 
-                   resident_role in invited.roles)
-        
-        c.execute('''UPDATE referrals 
-                    SET is_validated = ?
-                    WHERE inviter_id = ? AND invited_id = ?''',
-                 (is_valid, inviter_id, invited_id))
-    
-    conn.commit()
-    conn.close()
-    
-    await status_message.edit(content="✅ Validation status has been updated!")
-    await post_leaderboard()
-
+# Update the leaderboard command
 @bot.command(name='leaderboard')
-@commands.check(check_channel)
+@dm_only()
+@cooldown(1, 900, BucketType.user)  # 1 use per 15 minutes (900 seconds) per user
 async def show_leaderboard(ctx):
     print(f'\n[Command] Leaderboard command used by {ctx.author.name} (ID: {ctx.author.id})')
     
@@ -383,57 +542,35 @@ async def show_leaderboard(ctx):
     leaderboard = c.fetchall()
     conn.close()
     
-    if not leaderboard:
-        empty_embed = discord.Embed(
-            title="<:nrrp:1313023333251420210> Referral Leaderboard",
-            description="No referrals tracked yet! Be the first one to invite someone! ⭐\n\u200b",  # Added blank line
-            color=discord.Color.red()
-        )
-        
-        empty_embed.add_field(
-            name="🎯 How to Start?",
-            value="Create an invite link and share it with your friends! 🔗\n\u200b",  # Added blank line
-            inline=False
-        )
-
-        
-        empty_embed.add_field(
-            name="📝 Available Commands",
-            value="•   `!myreferrals` - View your referral history\n"  # Added extra newline between commands
-                  "•   `!leaderboard` - Show the referral rankings",
-            inline=False
-        )
-        
-        empty_embed.set_footer(text="💡 Tip: Your invites will appear here once someone joins using your invite link!")
-        
-        await ctx.send(embed=empty_embed)
-        return
-    
     embed = discord.Embed(
         title="<:nrrp:1313023333251420210> Referral Leaderboard", 
         color=discord.Color.red(),
-        description="📢 **Reminder:** The joinee needs to whitelist in order for your invite to be verified! bPlease make sure they do so!\n\u200b"  # Added line break and blank line
+        description="📢 **Reminder:** The joinee needs to whitelist in order for your invite to be verified! **Please make sure they do so!**\n\u200b"
     )
+    
+    if not leaderboard:
+        embed.description += "\nNo referrals tracked yet! Be the first one to invite someone! ⭐"
+        await ctx.send(embed=embed)
+        return
+    
+    leaderboard_text = "```\nInviter              ✅ Verified   ⏳ Pending   📊 Total\n"
+    leaderboard_text += "─" * 56 + "\n"
 
-    # Create the header
-    leaderboard_text = "```\nInviter               ✅ Verified   ⏳ Pending   📊 Total\n"
-    leaderboard_text += "─" * 55 + "\n"  # Separator line
-
-    # Add each row
+    guild = bot.get_guild(GUILD_ID)
     for i, (inviter_id, inviter_name, validated, unvalidated, total) in enumerate(leaderboard, 1):
-        inviter = ctx.guild.get_member(int(inviter_id))
+        inviter = guild.get_member(int(inviter_id))
         current_name = inviter.name if inviter else inviter_name or f"User {inviter_id}"
-        # Pad the name to 20 characters, numbers to 11 characters each
-        name_field = f"{i}. {current_name[:17]:<17}"
-        leaderboard_text += f"{name_field}    {validated:^11} {unvalidated:^11} {total:^7}\n"
+        
+        name_field = f"{i}. {current_name[:20]}"
+        leaderboard_text += f"{name_field:<24}   {validated:^10}   {unvalidated:^10}   {total:^6}\n"
 
     leaderboard_text += "```"
-
-    # Add single field with all content
     embed.add_field(name="\u200b", value=leaderboard_text, inline=False)
+    embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    return await ctx.send(embed=embed)
+    await ctx.send(embed=embed)
 
+# Update the error handling
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
@@ -445,37 +582,37 @@ async def on_command_error(ctx, error):
         
         embed.add_field(
             name="Available Commands",
-            value="•  `!myreferrals` - View your referral history\n"
-                  "•  `!leaderboard` - Show the referral rankings\n",
+            value="•  `!myreferrals` - View your referral history (DM only)\n"
+                  "•  `!leaderboard` - Show the referral rankings (DM only)\n"
+                  "•  `!validate` - [Admin] Validate referrals and update leaderboard\n",
             inline=False
         )
         
-        embed.set_footer(text="💡 Tip: Use these commands in the designated channels")
+        embed.set_footer(text="💡 Tip: Use !myreferrals and !leaderboard in DMs with the bot")
         
     elif isinstance(error, commands.CheckFailure):
+        if isinstance(error, commands.PrivateMessageOnly):
+            embed = discord.Embed(
+                title="⚠️ DM Only Command",
+                color=discord.Color.red(),
+                description="This command can only be used in DMs with the bot."
+            )
+        else:
+            embed = discord.Embed(
+                title="⚠️ Permission Error",
+                color=discord.Color.red(),
+                description="You don't have permission to use this command or you're using it in the wrong channel."
+            )
+    
+    elif isinstance(error, CommandOnCooldown):
+        minutes_left = int(error.retry_after / 60)
+        seconds_left = int(error.retry_after % 60)
         embed = discord.Embed(
-            title="⚠️ Permission Error",
-            color=discord.Color.red(),
-            description="You don't have permission to use this command or you're using it in the wrong channel."
+            title="⏳ Command on Cooldown",
+            color=discord.Color.gold(),
+            description=f"Please wait {minutes_left}m {seconds_left}s before using this command again."
         )
-        
-        embed.add_field(
-            name="What happened?",
-            value="This could be because:\n"
-                  "• You're using the command in the wrong channel\n"
-                  "• You don't have the required permissions\n"
-                  "• The command is restricted to specific roles",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Solution",
-            value="Try using the command in the designated channels:\n"
-                  "• #commands\n"
-                  "• #leaderboard",
-            inline=False
-        )
-        
+    
     else:
         print(f"Error: {str(error)}")
         embed = discord.Embed(
@@ -490,10 +627,14 @@ async def on_command_error(ctx, error):
             inline=False
         )
         
-        # Add timestamp to error messages
         embed.timestamp = datetime.now()
     
-    await ctx.send(embed=embed)
+    try:
+        # Send as ephemeral message that only the command user can see
+        await ctx.send(embed=embed, ephemeral=True)
+    except AttributeError:
+        # Fallback for text channels where ephemeral messages aren't supported
+        await ctx.send(embed=embed)
 
 # Run the bot
 bot.run(DISCORD_TOKEN)
