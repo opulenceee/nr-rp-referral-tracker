@@ -57,9 +57,9 @@ async def validate_referrals(guild):
     """Validates all referrals and updates their status"""
     print('\n[Auto-Validation] Starting validation process...')
     
-    resident_role = discord.utils.get(guild.roles, name='resident')
+    resident_role = discord.utils.get(guild.roles, name='Resident')
     if not resident_role:
-        print("Error: 'resident' role not found!")
+        print("Error: 'Resident' role not found!")
         return
 
     conn = sqlite3.connect('referrals.db')
@@ -361,9 +361,9 @@ async def on_member_remove(member):
 @commands.check(check_channel)
 async def validate_referrals_command(ctx):
     print(f'\n[Command] Validate command used by {ctx.author.name} (ID: {ctx.author.id})')
-    resident_role = discord.utils.get(ctx.guild.roles, name='resident')
+    resident_role = discord.utils.get(ctx.guild.roles, name='Resident')
     if not resident_role:
-        await ctx.send("Error: 'resident' role not found!")
+        await ctx.send("Error: 'Resident' role not found!")
         return
 
     status_message = await ctx.send("Starting validation process...")
