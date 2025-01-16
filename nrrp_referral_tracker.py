@@ -344,6 +344,7 @@ async def update_leaderboard():
             SUM(CASE WHEN is_validated = FALSE AND is_member_active = TRUE THEN 1 ELSE 0 END) as unvalidated_count,
             SUM(CASE WHEN is_member_active = TRUE THEN 1 ELSE 0 END) as total_count
         FROM referrals 
+        WHERE inviter_id != '845819834696597504' AND inviter_id != '851302798247067678'  -- Replace with actual Discord ID
         GROUP BY inviter_id, inviter_name
         HAVING total_count > 0
         ORDER BY validated_count DESC, total_count DESC
@@ -1197,6 +1198,7 @@ async def show_leaderboard(ctx):
             SUM(CASE WHEN is_validated = FALSE AND is_member_active = TRUE THEN 1 ELSE 0 END) as unvalidated_count,
             SUM(CASE WHEN is_member_active = TRUE THEN 1 ELSE 0 END) as total_count
         FROM referrals 
+        WHERE inviter_id != '845819834696597504' AND inviter_id != '851302798247067678'  -- Replace with actual Discord ID
         GROUP BY inviter_id, inviter_name
         HAVING total_count > 0
         ORDER BY validated_count DESC, total_count DESC
